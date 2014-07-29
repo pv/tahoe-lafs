@@ -29,7 +29,7 @@ from allmydata.util import deferredutil
 from allmydata.util.assertutil import _assert, precondition
 from allmydata.util.consumer import download_to_data
 from allmydata.interfaces import IFileNode, IDirectoryNode, ExistingChildError, \
-     NoSuchChildError, ChildOfWrongTypeError
+     NoSuchChildError, ChildOfWrongTypeError, DownloadStopped
 from allmydata.mutable.common import NotWriteableError
 from allmydata.mutable.publish import MutableFileHandle
 from allmydata.immutable.upload import FileHandle
@@ -293,273 +293,502 @@ def _direntry_for(filenode_or_parent, childname, filenode=None):
     return None
 
 
+DOWNLOAD_BLOCK_SIZE = 131072
+
+
 class OverwriteableFileConsumer(PrefixingLogMixin):
     implements(IConsumer)
-    """I act both as a consumer for the download of the original file contents, and as a
-    wrapper for a temporary file that records the downloaded data and any overwrites.
-    I use a priority queue to keep track of which regions of the file have been overwritten
-    but not yet downloaded, so that the download does not clobber overwritten data.
-    I use another priority queue to record milestones at which to make callbacks
-    indicating that a given number of bytes have been downloaded.
+    """I download original file contents from a file node as needed, and use
+    BlockCachedFile for storing a cached copy that records the downloaded data
+    and any overwrites. Caching logic is contained in BlockCachedFile. Before
+    using me for read/write operations, the necessary data regions must be
+    fetched using my when_cached method.
 
-    The temporary file reflects the contents of the file that I represent, except that:
-     - regions that have neither been downloaded nor overwritten, if present,
-       contain garbage.
-     - the temporary file may be shorter than the represented file (it is never longer).
-       The latter's current size is stored in self.current_size.
+    I switch to a new download connection if the data to be read is too far from
+    the position of the currently active download. If no read requests are
+    pending, I stop or pause the download.
 
     This abstraction is mostly independent of SFTP. Consider moving it, if it is found
     useful for other frontends."""
 
-    def __init__(self, download_size, tempfile_maker):
+    def __init__(self, file_version, tempfile_maker):
         PrefixingLogMixin.__init__(self, facility="tahoe.sftp")
-        if noisy: self.log(".__init__(%r, %r)" % (download_size, tempfile_maker), level=NOISY)
-        self.download_size = download_size
-        self.current_size = download_size
-        self.f = tempfile_maker()
-        self.downloaded = 0
-        self.milestones = []  # empty heap of (offset, d)
-        self.overwrites = []  # empty heap of (start, end)
-        self.is_closed = False
 
-        self.done = defer.Deferred()
-        self.done_status = None  # None -> not complete, Failure -> download failed, str -> download succeeded
+        if file_version is not None:
+            initial_size = file_version.get_size()
+        else:
+            initial_size = 0
+
+        self.filenode_version = file_version
+        self.cache_file = BlockCachedFile(tempfile_maker, initial_size)
+        self.pending = []  # (offset, length, is_write, deferred)
+
         self.producer = None
+        self.streaming = False
+        self.paused = False
 
-    def get_file(self):
-        return self.f
+        self.data = []
+        self.offset = 0
+        self.size = 0
 
-    def get_current_size(self):
-        return self.current_size
+    def registerProducer(self, producer, streaming):
+        if noisy:
+            self.log('.registerProducer(%r, %r)' % (producer, streaming), level=NOISY)
 
-    def set_current_size(self, size):
-        if noisy: self.log(".set_current_size(%r), current_size = %r, downloaded = %r" %
-                           (size, self.current_size, self.downloaded), level=NOISY)
-        if size < self.current_size or size < self.downloaded:
-            self.f.truncate(size)
-        if size > self.current_size:
-            self.overwrite(self.current_size, "\x00" * (size - self.current_size))
-        self.current_size = size
-
-        # make the invariant self.download_size <= self.current_size be true again
-        if size < self.download_size:
-            self.download_size = size
-
-        if self.downloaded >= self.download_size:
-            self.download_done("size changed")
-
-    def registerProducer(self, p, streaming):
-        if noisy: self.log(".registerProducer(%r, streaming=%r)" % (p, streaming), level=NOISY)
         if self.producer is not None:
             raise RuntimeError("producer is already registered")
 
-        self.producer = p
-        if streaming:
-            # call resumeProducing once to start things off
-            p.resumeProducing()
-        else:
-            def _iterate():
-                if self.done_status is None:
-                    p.resumeProducing()
-                    eventually(_iterate)
-            _iterate()
+        self.producer = producer
+        self.streaming = streaming
+        self.paused = False
+        self.data = []
+        self.size = 0
 
-    def write(self, data):
-        if noisy: self.log(".write(<data of length %r>)" % (len(data),), level=NOISY)
-        if self.is_closed:
-            return
-
-        if self.downloaded >= self.download_size:
-            return
-
-        next_downloaded = self.downloaded + len(data)
-        if next_downloaded > self.download_size:
-            data = data[:(self.download_size - self.downloaded)]
-
-        while len(self.overwrites) > 0:
-            (start, end) = self.overwrites[0]
-            if start >= next_downloaded:
-                # This and all remaining overwrites are after the data we just downloaded.
-                break
-            if start > self.downloaded:
-                # The data we just downloaded has been partially overwritten.
-                # Write the prefix of it that precedes the overwritten region.
-                self.f.seek(self.downloaded)
-                self.f.write(data[:(start - self.downloaded)])
-
-            # This merges consecutive overwrites if possible, which allows us to detect the
-            # case where the download can be stopped early because the remaining region
-            # to download has already been fully overwritten.
-            heapq.heappop(self.overwrites)
-            while len(self.overwrites) > 0:
-                (start1, end1) = self.overwrites[0]
-                if start1 > end:
-                    break
-                end = end1
-                heapq.heappop(self.overwrites)
-
-            if end >= next_downloaded:
-                # This overwrite extends past the downloaded data, so there is no
-                # more data to consider on this call.
-                heapq.heappush(self.overwrites, (next_downloaded, end))
-                self._update_downloaded(next_downloaded)
-                return
-            elif end >= self.downloaded:
-                data = data[(end - self.downloaded):]
-                self._update_downloaded(end)
-
-        self.f.seek(self.downloaded)
-        self.f.write(data)
-        self._update_downloaded(next_downloaded)
-
-    def _update_downloaded(self, new_downloaded):
-        self.downloaded = new_downloaded
-        milestone = new_downloaded
-        if len(self.overwrites) > 0:
-            (start, end) = self.overwrites[0]
-            if start <= new_downloaded and end > milestone:
-                milestone = end
-
-        while len(self.milestones) > 0:
-            (next, d) = self.milestones[0]
-            if next > milestone:
-                return
-            if noisy: self.log("MILESTONE %r %r" % (next, d), level=NOISY)
-            heapq.heappop(self.milestones)
-            eventually_callback(d)("reached")
-
-        if milestone >= self.download_size:
-            self.download_done("reached download size")
-
-    def overwrite(self, offset, data):
-        if noisy: self.log(".overwrite(%r, <data of length %r>)" % (offset, len(data)), level=NOISY)
-        if self.is_closed:
-            self.log("overwrite called on a closed OverwriteableFileConsumer", level=WEIRD)
-            raise SFTPError(FX_BAD_MESSAGE, "cannot write to a closed file handle")
-
-        if offset > self.current_size:
-            # Normally writing at an offset beyond the current end-of-file
-            # would leave a hole that appears filled with zeroes. However, an
-            # EncryptedTemporaryFile doesn't behave like that (if there is a
-            # hole in the file on disk, the zeroes that are read back will be
-            # XORed with the keystream). So we must explicitly write zeroes in
-            # the gap between the current EOF and the offset.
-
-            self.f.seek(self.current_size)
-            self.f.write("\x00" * (offset - self.current_size))
-            start = self.current_size
-        else:
-            self.f.seek(offset)
-            start = offset
-
-        self.f.write(data)
-        end = offset + len(data)
-        self.current_size = max(self.current_size, end)
-        if end > self.downloaded:
-            heapq.heappush(self.overwrites, (start, end))
-
-    def read(self, offset, length):
-        """When the data has been read, callback the Deferred that we return with this data.
-        Otherwise errback the Deferred that we return.
-        The caller must perform no more overwrites until the Deferred has fired."""
-
-        if noisy: self.log(".read(%r, %r), current_size = %r" % (offset, length, self.current_size), level=NOISY)
-        if self.is_closed:
-            self.log("read called on a closed OverwriteableFileConsumer", level=WEIRD)
-            raise SFTPError(FX_BAD_MESSAGE, "cannot read from a closed file handle")
-
-        # Note that the overwrite method is synchronous. When a write request is processed
-        # (e.g. a writeChunk request on the async queue of GeneralSFTPFile), overwrite will
-        # be called and will update self.current_size if necessary before returning. Therefore,
-        # self.current_size will be up-to-date for a subsequent call to this read method, and
-        # so it is correct to do the check for a read past the end-of-file here.
-        if offset >= self.current_size:
-            def _eof(): raise EOFError("read past end of file")
-            return defer.execute(_eof)
-
-        if offset + length > self.current_size:
-            length = self.current_size - offset
-            if noisy: self.log("truncating read to %r bytes" % (length,), level=NOISY)
-
-        needed = min(offset + length, self.download_size)
-
-        # If we fail to reach the needed number of bytes, the read request will fail.
-        d = self.when_reached_or_failed(needed)
-        def _reached_in_read(res):
-            # It is not necessarily the case that self.downloaded >= needed, because
-            # the file might have been truncated (thus truncating the download) and
-            # then extended.
-
-            _assert(self.current_size >= offset + length,
-                    current_size=self.current_size, offset=offset, length=length)
-            if noisy: self.log("_reached_in_read(%r), self.f = %r" % (res, self.f,), level=NOISY)
-            self.f.seek(offset)
-            return self.f.read(length)
-        d.addCallback(_reached_in_read)
-        return d
-
-    def when_reached_or_failed(self, index):
-        if noisy: self.log(".when_reached_or_failed(%r)" % (index,), level=NOISY)
-        def _reached(res):
-            if noisy: self.log("reached %r with result %r" % (index, res), level=NOISY)
-            return res
-
-        if self.done_status is not None:
-            return defer.execute(_reached, self.done_status)
-        if index <= self.downloaded:  # already reached successfully
-            if noisy: self.log("already reached %r successfully" % (index,), level=NOISY)
-            return defer.succeed("already reached successfully")
-        d = defer.Deferred()
-        d.addCallback(_reached)
-        heapq.heappush(self.milestones, (index, d))
-        return d
-
-    def when_done(self):
-        d = defer.Deferred()
-        self.done.addCallback(lambda ign: eventually_callback(d)(self.done_status))
-        return d
-
-    def download_done(self, res):
-        _assert(isinstance(res, (str, Failure)), res=res)
-        # Only the first call to download_done counts, but we log subsequent calls
-        # (multiple calls are normal).
-        if self.done_status is not None:
-            self.log("IGNORING extra call to download_done with result %r; previous result was %r"
-                     % (res, self.done_status), level=OPERATIONAL)
-            return
-
-        self.log("DONE with result %r" % (res,), level=OPERATIONAL)
-
-        # We avoid errbacking self.done so that we are not left with an 'Unhandled error in Deferred'
-        # in case when_done() is never called. Instead we stash the failure in self.done_status,
-        # from where the callback added in when_done() can retrieve it.
-        self.done_status = res
-        eventually_callback(self.done)(None)
-
-        while len(self.milestones) > 0:
-            (next, d) = self.milestones[0]
-            if noisy: self.log("MILESTONE FINISH %r %r %r" % (next, d, res), level=NOISY)
-            heapq.heappop(self.milestones)
-            # The callback means that the milestone has been reached if
-            # it is ever going to be. Note that the file may have been
-            # truncated to before the milestone.
-            eventually_callback(d)(res)
-
-    def close(self):
-        if not self.is_closed:
-            self.is_closed = True
-            try:
-                self.f.close()
-            except Exception, e:
-                self.log("suppressed %r from close of temporary file %r" % (e, self.f), level=WEIRD)
-        self.download_done("closed")
-        return self.done_status
+        self.producer.resumeProducing()
 
     def unregisterProducer(self):
-        # This will happen just before our client calls download_done, which will tell
-        # us the outcome of the download; we don't know the outcome at this point.
+        if noisy:
+            self.log('.unregisterProducer()', level=NOISY)
         self.producer = None
-        self.log("producer unregistered", level=NOISY)
+        self.data = []
+
+    def write(self, data):
+        if noisy:
+            self.log('.write()', level=NOISY)
+
+        self.data.append(data)
+        self.size += len(data)
+        self.offset, self.data = self.cache_file.receive_cached_data(self.offset, self.data)
+
+        self._flush_pending()
+        self._reschedule_pending()
+
+        if self.producer is not None and not self.streaming:
+            eventually(self._produce)
+
+    def _produce(self):
+        if self.producer is not None and not self.streaming:
+            self.producer.resumeProducing()
+
+    def _flush_pending(self):
+        if noisy:
+            self.log('._flush_pending() - %d pending' % (len(self.pending),), level=NOISY)
+
+        while self.pending:
+            offset, length, write, deferred = self.pending[0]
+
+            if write:
+                required = self.cache_file.pre_write(offset, length)
+            else:
+                required = self.cache_file.pre_read(offset, length)
+
+            if required is None:
+                # Cache ready
+                self.pending.pop(0)
+                deferred.callback(None)
+            else:
+                # Cache not ready. Retain the order of the pending operations.
+                break
+
+    def _reschedule_pending(self):
+        if noisy:
+            self.log('._reschedule_pending()', level=NOISY)
+
+        if not self.pending:
+            # No data needed currently
+            if self.producer:
+                if self.streaming:
+                    self.producer.pauseProducing()
+                    self.paused = True
+                else:
+                    self.producer.stopProducing()
+                    self.unregisterProducer()
+            return
+
+        offset, length, write, deferred = self.pending[0]
+        if write:
+            offset, length = self.cache_file.pre_write(offset, length)
+        else:
+            offset, length = self.cache_file.pre_read(offset, length)
+
+        if self.producer is not None:
+            if offset < self.offset or offset > self.offset + self.size + DOWNLOAD_BLOCK_SIZE:
+                # Negative or large positive seek in data: need to reposition
+                self.producer.stopProducing()
+                self.unregisterProducer()
+
+        if self.producer is None:
+            # Schedule new download
+            self.offset = offset
+            d = self.filenode_version.read(self, offset)
+            d.addCallbacks(self._download_complete, self._download_error)
+            # It is correct to drop d here
+
+            if noisy:
+                self.log('._reschedule_pending() - start reading at %d for (%d bytes @ %d)'
+                         % (offset, length, offset), level=NOISY)
+        else:
+            # Continue using the current producer
+            if noisy:
+                self.log('._reschedule_pending() - continue reading for (%d bytes @ %d)'
+                         % (length, offset), level=NOISY)
+
+            if self.producer is not None and self.paused:
+                self.producer.resumeProducing()
+                self.paused = False
+
+    def _download_error(self, err):
+        if noisy:
+            self.log('._download_error(%r)' % (err,), level=NOISY)
+
+        if not isinstance(err.value, DownloadStopped):
+            # stop reading and fail all pending operations
+            if self.producer is not None:
+                self.producer.stopProducing()
+                self.unregisterProducer()
+
+            pending = self.pending
+            self.pending = []
+            for _, _, _, deferred in pending:
+                deferred.errback(err)
+
+        return None
+
+    def _download_complete(self, ign):
+        if noisy:
+            self.log('._download_complete()', level=NOISY)
+
+        # Since we don't necessarily fetch all data in one go, downloads can
+        # terminate before all pending operations are satisfied
+        self._flush_pending()
+        self._reschedule_pending()
+        return None
+
+    def when_cached(self, offset, length, write=False):
+        d = defer.Deferred()
+        self.pending.append((offset, length, write, d))
+        self._flush_pending()
+        self._reschedule_pending()
+        return d
+
+    def when_fully_cached(self):
+        return self.when_cached(0, self.cache_file.cache_size, write=False)
+
+    def close(self):
+        if self.producer is not None:
+            self.producer.stopProducing()
+            self.unregisterProducer()
+
+        err = Failure(IOError("file closed"))
+        pending = self.pending
+        self.pending = []
+        for _, _, _, deferred in pending:
+            deferred.errback(err)
+
+        self.cache_file.close()
+
+    def get_size(self):
+        return self.cache_file.get_size()
+
+    def get_file(self):
+        return self.cache_file.get_file()
+
+    def truncate(self, size):
+        self.cache_file.truncate(size)
+
+    def read(self, offset, length):
+        return self.cache_file.read(offset, length)
+
+    def overwrite(self, offset, data):
+        self.cache_file.write(offset, data)
+
+
+class BlockCachedFile(PrefixingLogMixin):
+    """
+    I am temporary file, caching data for a remote file. I support
+    overwriting data. I cache remote data on a per-block basis and
+    keep track of which blocks need still to be retrieved. Before each
+    read/write operation, my pre_read or pre_write method needs to be
+    called --- these give the ranges of data that need to be retrieved
+    from the remote file and fed to me (via receive_cached_data)
+    before the read/write operation can succeed. I am fully
+    synchronous.
+    """
+
+    def __init__(self, tempfile_maker, initial_cache_size, block_size=None):
+        PrefixingLogMixin.__init__(self, facility="tahoe.sftp")
+
+        if block_size is None:
+            block_size = DOWNLOAD_BLOCK_SIZE
+
+        self.f = tempfile_maker()
+        self.actual_size = 0
+        self.block_size = block_size
+
+        self.cache_size = initial_cache_size
+        num_blocks, remainder = divmod(self.cache_size, self.block_size)
+        if remainder != 0:
+            num_blocks += 1
+        self.cache_map = BitArray(num_blocks)
+        self.first_uncached_block = 0
+
+    def _get_block_range(self, offset, length, inner=False):
+        """
+        For inner=False: compute block range fully containing [offset, offset+length)
+        For inner=True: compute block range fully contained in [offset, offset+length)
+        """
+        if offset >= self.cache_size:
+            length = 0
+        else:
+            length = min(length, self.cache_size - offset)
+
+        if length == 0:
+            return 0, 0, 0, 0
+
+        start_block, start_skip = divmod(offset, self.block_size)
+        end_block, end_skip = divmod(offset + length, self.block_size)
+
+        if inner:
+            if start_skip > 0:
+                start_block += 1
+                start_skip = self.block_size - start_skip
+
+            if offset + length == self.cache_size and end_skip > 0:
+                # the last block can be partial
+                end_skip = 0
+                end_block += 1
+        else:
+            if end_skip > 0:
+                end_block += 1
+                if offset + length == self.cache_size:
+                    # last block can be partial
+                    end_skip = 0
+                else:
+                    end_skip = self.block_size - end_skip
+
+        return start_block, end_block, start_skip, end_skip
+
+    def _pad_file(self, new_size):
+        """
+        Append zero bytes to self.f so that its size grows to new_size
+        """
+        if new_size <= self.actual_size:
+            return
+
+        self.f.seek(0, 2)
+
+        nblocks, remainder = divmod(new_size - self.actual_size, self.block_size)
+        if nblocks > 0:
+            blk = "\x00" * self.block_size
+            for j in range(nblocks):
+                self.f.write(blk)
+        if remainder > 0:
+            self.f.write("\x00" * remainder)
+
+        self.actual_size = new_size
+
+    def receive_cached_data(self, offset, data_list):
+        """
+        Write full data blocks to file, unless they were not written
+        yet. Returns (new_offset, new_data_list) containing unused,
+        possibly reuseable data. data_list is a list of strings.
+        """
+        if noisy:
+            self.log(".receive_cached_data()", level=NOISY)
+
+        data_size = sum(len(data) for data in data_list)
+
+        start_block, end_block, start_skip, end_skip = self._get_block_range(
+            offset, data_size, inner=True)
+
+        if start_block == end_block:
+            # not enough data
+            return offset, data_list
+
+        data = "".join(data_list)[start_skip:]
+
+        if start_block < self.first_uncached_block:
+            i = self.first_uncached_block - start_block
+            start_block = self.first_uncached_block
+        else:
+            i = 0
+
+        for j in xrange(start_block, end_block):
+            if not self.cache_map[j]:
+                pos = j * self.block_size
+                block = data[i*self.block_size:(i+1)*self.block_size]
+                block = block[:(self.cache_size - pos)]
+                self._pad_file(pos)
+                self.f.seek(pos)
+                self.f.write(block)
+
+                self.actual_size = max(self.actual_size, pos + len(block))
+                self.cache_map[j] = True
+            i += 1
+
+        if start_block <= self.first_uncached_block:
+            self.first_uncached_block = max(self.first_uncached_block, end_block)
+
+        # Return trailing data for possible future use
+        if end_skip > 0:
+            data_list = [data[-end_skip:]]
+            offset += data_size - len(data_list[0])
+        else:
+            data_list = []
+            offset += data_size
+        return (offset, data_list)
+
+    def get_size(self):
+        return max(self.actual_size, self.cache_size)
+
+    def get_file(self):
+        # Pad file to full size before returning file handle
+        self._pad_file(self.get_size())
+        return self.f
+
+    def close(self):
+        self.f.close()
+        self.cache_map = BitArray(0)
+
+    def truncate(self, size):
+        if size < self.actual_size:
+            self.f.truncate(size)
+            self.actual_size = size
+        elif size > self.actual_size:
+            self._pad_file(size)
+
+        self.cache_size = min(size, self.cache_size)
+
+    def write(self, offset, data):
+        if offset > self.actual_size:
+            # Explicit POSIX behavior for write-past-end
+            self._pad_file(offset)
+
+        if len(data) == 0:
+            # noop
+            return
+
+        # Sanity check cache status
+        if self.pre_write(offset, len(data)) is not None:
+            raise RuntimeError("attempt to write before caching")
+
+        # Perform write
+        self.f.seek(offset)
+        self.f.write(data)
+        self.actual_size = max(self.actual_size, offset + len(data))
+
+        # Update cache status for completely overwritten blocks
+        start_block, end_block, _, _ = self._get_block_range(offset, len(data), inner=True)
+        for j in xrange(max(start_block, self.first_uncached_block), end_block):
+            self.cache_map[j] = True
+        if start_block <= self.first_uncached_block:
+            self.first_uncached_block = max(self.first_uncached_block, end_block)
+
+    def read(self, offset, length):
+        if noisy:
+            self.log(".read(%d, %d) (%d %d)" % (offset, length, self.actual_size, self.cache_size),
+                     level=NOISY)
+        if offset >= self.actual_size and offset >= self.cache_size:
+            raise EOFError("read past end of file")
+
+        # Sanity check cache status
+        if self.pre_read(offset, length) is not None:
+            raise RuntimeError("attempt to read before caching")
+
+        # Perform read
+        self.f.seek(offset)
+        return self.f.read(length)
+
+    def pre_read(self, offset, length):
+        """
+        Return (offset, length) of the first cache fetch that need to be
+        performed and the results fed into `receive_cached_data` before a read
+        operation can be performed. There may be more than one fetch
+        necessary. Return None if no fetch is necessary.
+        """
+        start_block, end_block, _, _ = self._get_block_range(offset, length)
+
+        if noisy:
+            self.log(".pre_read(%d, %d) -> %d-%d" % (offset, length, start_block, end_block),
+                     level=NOISY)
+
+        # Combine consequent blocks into a single read
+        j = start_block
+        while j < end_block and self.cache_map[j]:
+            j += 1
+        if j >= end_block:
+            return None
+
+        for k in xrange(j+1, end_block):
+            if self.cache_map[k]:
+                end = k
+                break
+        else:
+            end = end_block
+
+        start_pos = j * self.block_size
+        end_pos = end * self.block_size
+        if start_pos < self.cache_size:
+            return (start_pos, max(self.cache_size, end_pos) - start_pos)
+
+        return None
+
+    def pre_write(self, offset, length):
+        """
+        Similarly to pre_read, but for write operations.
+        """
+        start_block, end_block, start_skip, end_skip = self._get_block_range(offset, length)
+
+        if noisy:
+            self.log(".pre_write(%d, %d) -> %d-%d" % (offset, length, start_block, end_block),
+                     level=NOISY)
+
+        if start_block < end_block:
+            if (offset % self.block_size) != 0 and not self.cache_map[start_block]:
+                start_pos = start_block * self.block_size
+                end_pos = (start_block + 1) * self.block_size
+                if start_pos < self.cache_size:
+                    return (start_pos, max(self.cache_size, end_pos) - start_pos)
+
+            if ((offset + length) % self.block_size) != 0 and not self.cache_map[end_block - 1]:
+                start_pos = (end_block - 1) * self.block_size
+                end_pos = end_block * self.block_size
+                if start_pos < self.cache_size:
+                    return (start_pos, max(self.cache_size, end_pos) - start_pos)
+
+        # No reads required
+        return None
+
+
+class BitArray(object):
+    """
+    Mutable array of n bits
+    """
+    def __init__(self, n):
+        if n < 0:
+            raise ValueError("must have n >= 0")
+        self.n = n
+        self.value = 0
+        self.mask = 2**n - 1
+
+    def __getitem__(self, i):
+        if i < 0 or i >= self.n:
+            raise ValueError("out of bounds get")
+        return (self.value >> i) & 0x1
+
+    def __setitem__(self, i, value):
+        if i < 0 or i >= self.n:
+            raise ValueError("out of bounds set")
+        r = (0x1 << i)
+        if value:
+            self.value |= r
+        else:
+            r ^= self.mask
+            self.value &= r
+
+    def __repr__(self):
+        r = "".join('1' if self[i] else '0' for i in range(self.n))
+        return "<Bitarray %r>" % (r,)
 
 
 SIZE_THRESHOLD = 1000
@@ -678,6 +907,7 @@ class GeneralSFTPFile(PrefixingLogMixin):
         # self.consumer should only be relied on in callbacks for self.async, since it might
         # not be set before then.
         self.consumer = None
+        self.write_error = None
 
     def open(self, parent=None, childname=None, filenode=None, metadata=None):
         self.log(".open(parent=%r, childname=%r, filenode=%r, metadata=%r)" %
@@ -699,25 +929,14 @@ class GeneralSFTPFile(PrefixingLogMixin):
 
         if (self.flags & FXF_TRUNC) or not filenode:
             # We're either truncating or creating the file, so we don't need the old contents.
-            self.consumer = OverwriteableFileConsumer(0, tempfile_maker)
-            self.consumer.download_done("download not needed")
+            self.consumer = OverwriteableFileConsumer(None, tempfile_maker)
         else:
             self.async.addCallback(lambda ignored: filenode.get_best_readable_version())
-
             def _read(version):
-                if noisy: self.log("_read", level=NOISY)
-                download_size = version.get_size()
-                _assert(download_size is not None)
-
-                self.consumer = OverwriteableFileConsumer(download_size, tempfile_maker)
-
-                d = version.read(self.consumer, 0, None)
-                def _finished(res):
-                    if not isinstance(res, Failure):
-                        res = "download finished"
-                    self.consumer.download_done(res)
-                d.addBoth(_finished)
-                # It is correct to drop d here.
+                if noisy:
+                    self.log(".open -> _read", level=NOISY)
+                self.consumer = OverwriteableFileConsumer(version, tempfile_maker)
+                return None
             self.async.addCallback(_read)
 
         eventually_callback(self.async)(None)
@@ -771,11 +990,26 @@ class GeneralSFTPFile(PrefixingLogMixin):
 
         d = defer.Deferred()
         def _read(ign):
-            if noisy: self.log("_read in readChunk(%r, %r)" % (offset, length), level=NOISY)
-            d2 = self.consumer.read(offset, length)
-            d2.addBoth(eventually_callback(d))
-            # It is correct to drop d2 here.
+            if noisy:
+                self.log("_read in readChunk(%r, %r)" % (offset, length), level=NOISY)
+
+            # Schedule caching
+            d2 = self.consumer.when_cached(offset, length, write=False)
+            def _do_read(ign):
+                if noisy:
+                    self.log("_do_read in readChunk(%r, %r)" % (offset, length), level=NOISY)
+                # Cache is ready: read
+                try:
+                    data = self.consumer.read(offset, length)
+                except EOFError, err:
+                    return eventually_errback(d)(err)
+                eventually_callback(d)(data)
+                return None
+            d2.addCallbacks(_do_read, eventually_errback(d))
+            # It is correct to drop d2 here
+
             return None
+
         self.async.addCallbacks(_read, eventually_errback(d))
         d.addBoth(_convert_error, request)
         return d
@@ -803,15 +1037,31 @@ class GeneralSFTPFile(PrefixingLogMixin):
         #    and an error occurs while flushing cached writes during the close."
 
         def _write(ign):
-            if noisy: self.log("_write in .writeChunk(%r, <data of length %r>), current_size = %r" %
-                               (offset, len(data), self.consumer.get_current_size()), level=NOISY)
-            # FXF_APPEND means that we should always write at the current end of file.
-            write_offset = offset
-            if self.flags & FXF_APPEND:
-                write_offset = self.consumer.get_current_size()
+            if noisy: self.log("_write in .writeChunk(%r, <data of length %r>)" %
+                               (offset, len(data)), level=NOISY)
 
-            self.consumer.overwrite(write_offset, data)
-            if noisy: self.log("overwrite done", level=NOISY)
+            # Schedule caching
+            d2 = self.consumer.when_cached(offset, len(data), write=True)
+            def _do_write(ign):
+                if noisy:
+                    self.log("_do_write in writeChunk(%r, <data of length %r>)" %
+                             (offset, len(data)), level=NOISY)
+                # Cache is ready: write
+
+                # FXF_APPEND means that we should always write at the current end of file.
+                write_offset = offset
+                if self.flags & FXF_APPEND:
+                    write_offset = self.consumer.get_size()
+                self.consumer.overwrite(write_offset, data)
+                if noisy:
+                    self.log("write done", level=NOISY)
+                return None
+            def _do_write_error(err):
+                self.write_error = err
+                return None
+            d2.addCallbacks(_do_write, _do_write_error)
+            # It is correct to drop d2 here
+
             return None
         self.async.addCallback(_write)
         # don't addErrback to self.async, just allow subsequent async ops to fail.
@@ -819,16 +1069,16 @@ class GeneralSFTPFile(PrefixingLogMixin):
 
     def _do_close(self, res, d=None):
         if noisy: self.log("_do_close(%r)" % (res,), level=NOISY)
-        status = None
+
         if self.consumer:
-            status = self.consumer.close()
+            self.consumer.close()
 
         # We must close_notify before re-firing self.async.
         if self.close_notify:
             self.close_notify(self.userpath, self.parent, self.childname, self)
 
-        if not isinstance(res, Failure) and isinstance(status, Failure):
-            res = status
+        if not isinstance(res, Failure) and isinstance(self.write_error, Failure):
+            res = self.write_error
 
         if d:
             eventually_callback(d)(res)
@@ -868,7 +1118,8 @@ class GeneralSFTPFile(PrefixingLogMixin):
         has_changed = self.has_changed
 
         def _commit(ign):
-            d2 = self.consumer.when_done()
+            # Full-file download
+            d2 = self.consumer.when_fully_cached()
             if self.filenode and self.filenode.is_mutable():
                 self.log("update mutable file %r childname=%r metadata=%r"
                          % (self.filenode, childname, self.metadata), level=OPERATIONAL)
@@ -883,6 +1134,7 @@ class GeneralSFTPFile(PrefixingLogMixin):
                     u = FileHandle(self.consumer.get_file(), self.convergence)
                     return parent.add_file(childname, u, metadata=self.metadata)
                 d2.addCallback(_add_file)
+
             return d2
 
         # If the file has been abandoned, we don't want the close operation to get "stuck",
@@ -916,7 +1168,7 @@ class GeneralSFTPFile(PrefixingLogMixin):
             if noisy: self.log("_get(%r) in %r, filenode = %r, metadata = %r" % (ign, request, self.filenode, self.metadata), level=NOISY)
 
             # self.filenode might be None, but that's ok.
-            attrs = _populate_attrs(self.filenode, self.metadata, size=self.consumer.get_current_size())
+            attrs = _populate_attrs(self.filenode, self.metadata, size=self.consumer.get_size())
             eventually_callback(d)(attrs)
             return None
         self.async.addCallbacks(_get, eventually_errback(d))
@@ -954,7 +1206,7 @@ class GeneralSFTPFile(PrefixingLogMixin):
             if size is not None:
                 # TODO: should we refuse to truncate a file opened with FXF_APPEND?
                 # <http://allmydata.org/trac/tahoe-lafs/ticket/1037#comment:20>
-                self.consumer.set_current_size(size)
+                self.consumer.truncate(size)
             eventually_callback(d)(None)
             return None
         self.async.addCallbacks(_set, eventually_errback(d))

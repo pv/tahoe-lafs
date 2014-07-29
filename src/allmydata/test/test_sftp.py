@@ -72,6 +72,7 @@ class Handler(GridTestMixin, ShouldFailMixin, ReallyEqualMixin, unittest.TestCas
             self.root = node
             self.root_uri = node.get_uri()
             sftpd._reload()
+            sftpd.DOWNLOAD_BLOCK_SIZE = 2     # force smaller cache file block size (try to trigger errors)
             self.handler = sftpd.SFTPUserHandler(self.client, self.root, self.username)
         d.addCallback(_created_root)
         return d
